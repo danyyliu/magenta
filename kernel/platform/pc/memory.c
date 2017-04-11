@@ -6,6 +6,7 @@
 
 #include <assert.h>
 #include <err.h>
+#include <kernel/cmdline.h>
 #include <kernel/vm.h>
 #include <platform/pc/bootloader.h>
 #include <magenta/boot/multiboot.h>
@@ -81,6 +82,15 @@ static int mem_arena_init(boot_addr_range_t *range)
 {
     int used = 0;
 
+    /* kernel.memory_limit allows an upper bound on cumulative size for "memory"
+     * arena entries to be imposed, effectively imposing an artificial system
+     * memory limit. If none is processed from the cmdline then the max is set
+     * to the largest uint64 to keep the logic simple.
+     */
+    uint64_t memory_limit = cmdline_get_uint64("kernel.memory-limit", UINT64_MAX);
+    uint64_t memory_allowed = ROUNDDOWN(memory_limit, PAGE_SIZE);
+    LTRACEF("Memory limit of %" PRIx64 " imposed on the 'memory' arenas\n", memory_allowed);
+
     for (range->reset(range), range->advance(range);
          !range->is_reset && used < PMM_ARENAS;
          range->advance(range)) {
@@ -89,6 +99,9 @@ static int mem_arena_init(boot_addr_range_t *range)
                 range->base, range->size, range->is_mem ? "" : "not ");
 
         if (!range->is_mem)
+            continue;
+
+        if (memory_allowed == 0)
             continue;
 
         /* trim off parts of memory ranges that are smaller than a page */
@@ -104,6 +117,15 @@ static int mem_arena_init(boot_addr_range_t *range)
 
             base += adjust;
             size -= adjust;
+        }
+
+        /* handle truncating to fit within any defined memory limits */
+        if (memory_allowed >= size) {
+            memory_allowed -= size;
+        } else {
+            LTRACEF("truncating range at %#" PRIxPTR " of %#zx bytes to %#zx bytes\n", base, size, memory_allowed);
+            size = ROUNDDOWN(memory_allowed, PAGE_SIZE);
+            memory_allowed = 0;
         }
 
         pmm_arena_info_t *arena = &mem_arenas[used];
