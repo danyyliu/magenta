@@ -15,19 +15,6 @@
 //#define TRACE 1
 #include "xhci-debug.h"
 
-// state for current transfer
-// we keep this in the iotxn extra data
-typedef struct {
-    mx_off_t    offset;             // current offset in the txn
-    size_t      remaining;          // length of remaining data to transfer
-    uint8_t     ep_index;
-    uint8_t     ep_type;
-    uint8_t     direction;
-    bool        needs_data_event;   // true if we still need to queue data event TRB
-    bool        needs_status;       // true if we still need to queue status TRB
-} xhci_transfer_state_t;
-static_assert(sizeof(xhci_transfer_state_t) <= sizeof(iotxn_extra_data_t), "");
-
 //#define TRACE_TRBS 1
 #ifdef TRACE_TRBS
 static void print_trb(xhci_t* xhci, xhci_transfer_ring_t* ring, xhci_trb_t* trb) {
@@ -82,10 +69,136 @@ mx_status_t xhci_reset_endpoint(xhci_t* xhci, uint32_t slot_id, uint32_t endpoin
     return (cc == TRB_CC_SUCCESS ? NO_ERROR : ERR_INTERNAL);
 }
 
+// computes the number of packets required to send the txn
+static size_t xhci_compute_packet_count(iotxn_t* txn) {
+    size_t length = txn->length;
+    if (length == 0) return 0;
+
+    uint64_t page = 0;
+    size_t packet_count = 1;
+    size_t align_adjust = txn->vmo_offset & (PAGE_SIZE - 1);
+
+    if (align_adjust) {
+        // we will send the first unaligned sub-page separately
+        size_t page_remaining = PAGE_SIZE - align_adjust;
+        if (length <= page_remaining) {
+            return 1;
+        }
+        length -= page_remaining;
+        page++;
+        packet_count++;
+    }
+
+    // operating page aligned from now on
+    if (txn->phys_count == 1) {
+        // simple contiguous case
+        packet_count += (length + XHCI_MAX_DATA_BUFFER - 1) / XHCI_MAX_DATA_BUFFER;
+        return packet_count;
+    }
+
+    uint64_t last_page = page + length / PAGE_SIZE;
+    mx_paddr_t* phys_addrs = txn->phys;
+    mx_paddr_t phys = phys_addrs[page];
+    mx_off_t packet_length = 0;
+
+    // loop through physical addresses looking for discontinuities
+    while (++page < last_page) {
+        packet_length += PAGE_SIZE;
+        length -= PAGE_SIZE;
+
+        mx_paddr_t next = phys_addrs[page];
+        if (phys + PAGE_SIZE != next || packet_length == XHCI_MAX_DATA_BUFFER) {
+            packet_count++;
+            packet_length = 0;
+        }
+        phys = next;
+    }
+
+    // now look at remaining length
+    packet_length += length;
+    if (packet_length > XHCI_MAX_DATA_BUFFER) {
+        packet_count++;
+    }
+
+    return packet_count;
+}
+
+// computes physical address and length of next packet to send
+static void xhci_next_phys(iotxn_t* txn, xhci_transfer_state_t* state) {
+    mx_off_t offset = state->offset;
+    mx_paddr_t* phys_addrs = txn->phys;
+    size_t align_adjust = txn->vmo_offset & (PAGE_SIZE - 1);
+
+    if (offset == 0) {
+        // if vmo_offset is unaligned we send the first unaligned sub-page separately
+        // so remaining transfers will all be aligned
+        if (align_adjust) {
+            state->next_phys = phys_addrs[0] + align_adjust;
+            size_t page_remaining = PAGE_SIZE - align_adjust;
+            if (txn->length < page_remaining) {
+                state->next_length = txn->length;
+            } else {
+                state->next_length = page_remaining;
+            }
+            return;
+        }
+    }
+
+    if (txn->phys_count == 1) {
+        // simple contiguous case
+        state->next_phys = phys_addrs[0] + offset + align_adjust;
+        size_t length = txn->length - offset;
+
+        if (length > XHCI_MAX_DATA_BUFFER) {
+            state->next_length = XHCI_MAX_DATA_BUFFER;
+        } else {
+            state->next_length = length;
+        }
+        return;
+    }
+
+    // below is more complicated case where we need to watch for discontinuities
+    // in the physical address space
+    uint64_t page = (offset + align_adjust) / PAGE_SIZE;
+    uint64_t last_page = (txn->length + align_adjust) / PAGE_SIZE;
+    mx_paddr_t phys = phys_addrs[page];
+    state->next_phys = phys;
+    mx_off_t packet_length = 0;
+    bool discontiguous = false;
+
+    // loop through physical addresses looking for discontinuities
+    while (++page < last_page && packet_length < XHCI_MAX_DATA_BUFFER) {
+        packet_length += PAGE_SIZE;
+
+        mx_paddr_t next = phys_addrs[page];
+        if (phys + PAGE_SIZE != next) {
+            discontiguous = true;
+            break;
+        }
+        phys = next;
+    }
+
+    if (!discontiguous && page == last_page) {
+        // add any remaining length on last page
+        packet_length += (txn->length + align_adjust) & (PAGE_SIZE - 1);
+    }
+    if (packet_length > XHCI_MAX_DATA_BUFFER) {
+        packet_length = XHCI_MAX_DATA_BUFFER;
+    }
+    if (packet_length > txn->length - offset) {
+        packet_length = txn->length - offset;
+    }
+    state->next_length = packet_length;
+}
+
 // locked on ep->lock
 static mx_status_t xhci_start_transfer_locked(xhci_t* xhci, xhci_endpoint_t* ep, iotxn_t* txn) {
+    xhci_transfer_ring_t* ring = &ep->transfer_ring;
+    if (!ep->enabled)
+        return ERR_PEER_CLOSED;
+
     usb_protocol_data_t* proto_data = iotxn_pdata(txn, usb_protocol_data_t);
-    xhci_transfer_state_t* state = (xhci_transfer_state_t *)&txn->extra;
+    xhci_transfer_state_t* state = ep->transfer_state;
     memset(state, 0, sizeof(*state));
 
     if (txn->length > 0) {
@@ -97,7 +210,7 @@ static mx_status_t xhci_start_transfer_locked(xhci_t* xhci, xhci_endpoint_t* ep,
     }
 
     state->offset = 0;
-    state->remaining = txn->length;
+    state->packet_count = xhci_compute_packet_count(txn);
     state->ep_index = xhci_endpoint_index(proto_data->ep_address);
     xhci_endpoint_context_t* epc = ep->epc;
     uint32_t ep_type = XHCI_GET_BITS32(&epc->epc1, EP_CTX_EP_TYPE_START, EP_CTX_EP_TYPE_BITS);
@@ -114,17 +227,12 @@ static mx_status_t xhci_start_transfer_locked(xhci_t* xhci, xhci_endpoint_t* ep,
 
     size_t length = txn->length;
 
-    xhci_transfer_ring_t* ring = &ep->transfer_ring;
-    if (!ep->enabled)
-        return ERR_PEER_CLOSED;
 
     if (XHCI_GET_BITS32(&epc->epc0, EP_CTX_EP_STATE_START, EP_CTX_EP_STATE_BITS) == 2 /* halted */ ) {
         return ERR_IO_REFUSED;
     }
 
     uint32_t interruptor_target = 0;
-
-    // FIXME handle zero length packets
 
     if (setup) {
         // Setup Stage
@@ -150,63 +258,6 @@ static mx_status_t xhci_start_transfer_locked(xhci_t* xhci, xhci_endpoint_t* ep,
     return NO_ERROR;
 }
 
-// returns next contiguous range of physical memory in the transaction, its length,
-// and the number of remaining contiguous ranges that follow
-static void xhci_get_phys(iotxn_t* txn, mx_paddr_t* out_phys, size_t* out_phys_length,
-                          uint32_t* out_remaining_packets) {
-    xhci_transfer_state_t* state = (xhci_transfer_state_t *)&txn->extra;
-    mx_off_t offset = state->offset;
-    // offset must be page aligned
-    MX_DEBUG_ASSERT((offset & (PAGE_SIZE - 1)) == 0);
-
-    if (txn->phys_count == 1) {
-        // simple contiguous case
-        *out_phys = txn->phys[0] + offset;
-        size_t length = txn->length - offset;
-        if (length > XHCI_MAX_DATA_BUFFER) {
-            *out_phys_length = XHCI_MAX_DATA_BUFFER;
-        } else {
-            *out_phys_length = length;
-        }
-        *out_remaining_packets = length / XHCI_MAX_DATA_BUFFER;
-        return;
-    }
-
-    uint64_t page = offset / PAGE_SIZE;
-    mx_paddr_t* phys_addrs = txn->phys;
-    mx_paddr_t return_phys = phys_addrs[page];
-    size_t return_length = PAGE_SIZE;
-    uint32_t remaining_packets = 0;
-    bool found_first = false;   // set to true after we have found first contiguous range
-                                // and are now counting remaining packets
-
-    mx_paddr_t next_phys = return_phys + PAGE_SIZE;
-    size_t length = PAGE_SIZE;
-
-    for (offset += PAGE_SIZE; offset < txn->length; offset += PAGE_SIZE) {
-        mx_paddr_t phys = phys_addrs[++page];
-        if (length < XHCI_MAX_DATA_BUFFER && phys == next_phys) {
-            length += PAGE_SIZE;
-            next_phys += PAGE_SIZE;
-            if (!found_first) {
-                return_length += PAGE_SIZE;
-            }
-        } else {
-            if (!found_first) {
-                found_first = true;
-            }
-
-            remaining_packets++;
-            next_phys = phys + PAGE_SIZE;
-            length = PAGE_SIZE;
-        }
-    }
-
-    *out_phys = return_phys;
-    *out_phys_length = return_length;
-    *out_remaining_packets = remaining_packets;
-}
-
 // returns NO_ERROR if txn has been successfully queued,
 // ERR_SHOULD_WAIT if we ran out of TRBs and need to try again later,
 // or other error for a hard failure.
@@ -214,7 +265,7 @@ static mx_status_t xhci_continue_transfer_locked(xhci_t* xhci, xhci_endpoint_t* 
     xhci_transfer_ring_t* ring = &ep->transfer_ring;
 
     usb_protocol_data_t* proto_data = iotxn_pdata(txn, usb_protocol_data_t);
-    xhci_transfer_state_t* state = (xhci_transfer_state_t *)&txn->extra;
+    xhci_transfer_state_t* state = ep->transfer_state;
     size_t length = txn->length;
     size_t free_trbs = xhci_transfer_ring_free_trbs(&ep->transfer_ring);
     uint8_t direction = state->direction;
@@ -244,27 +295,25 @@ static mx_status_t xhci_continue_transfer_locked(xhci_t* xhci, xhci_endpoint_t* 
     }
 
     // Data Stage
-    while (state->remaining > 0 && free_trbs > 0) {
-        // offset must be page aligned
-        mx_paddr_t phys_addr;
-        size_t phys_length;
-        uint32_t remaining_packets;
-        xhci_get_phys(txn, &phys_addr, &phys_length, &remaining_packets);
-        size_t transfer_size = (phys_length < state->remaining ? phys_length : state->remaining);
+    while (state->offset < txn->length && free_trbs > 0) {
+        xhci_next_phys(txn, state);
+
+        size_t transfer_size = state->next_length;
 
         xhci_trb_t* trb = ring->current;
         xhci_clear_trb(trb);
-        XHCI_WRITE64(&trb->ptr, phys_addr);
+        XHCI_WRITE64(&trb->ptr, state->next_phys);
         XHCI_SET_BITS32(&trb->status, XFER_TRB_XFER_LENGTH_START, XFER_TRB_XFER_LENGTH_BITS, transfer_size);
         // number of packets remaining after this one
-        XHCI_SET_BITS32(&trb->status, XFER_TRB_TD_SIZE_START, XFER_TRB_TD_SIZE_BITS, remaining_packets);
+        uint32_t td_size = --state->packet_count;
+        XHCI_SET_BITS32(&trb->status, XFER_TRB_TD_SIZE_START, XFER_TRB_TD_SIZE_BITS, td_size);
         XHCI_SET_BITS32(&trb->status, XFER_TRB_INTR_TARGET_START, XFER_TRB_INTR_TARGET_BITS, interruptor_target);
 
         uint32_t control_bits = TRB_CHAIN;
-        if (remaining_packets == 0) {
+        if (td_size == 0) {
             control_bits |= XFER_TRB_ENT;
         }
-        if (state->ep_index == 0 && state->remaining == txn->length) {
+        if (state->ep_index == 0 && state->offset == 0) {
             // use TRB_TRANSFER_DATA for first data packet on setup requests
             control_bits |= (direction == USB_DIR_IN ? XFER_TRB_DIR_IN : XFER_TRB_DIR_OUT);
             trb_set_control(trb, TRB_TRANSFER_DATA, control_bits);
@@ -272,7 +321,7 @@ static mx_status_t xhci_continue_transfer_locked(xhci_t* xhci, xhci_endpoint_t* 
             // we currently do not support isoch buffers that span page boundaries
             // Section 3.2.11 in the XHCI spec describes how to handle this, but since
             // iotxn buffers are always close to the beginning of a page, this shouldn't be necessary.
-            if (transfer_size != state->remaining) {
+            if (transfer_size != txn->length) {
                 printf("isoch buffer spans page boundary in xhci_queue_transfer\n");
                 return ERR_INVALID_ARGS;
             }
@@ -294,10 +343,9 @@ static mx_status_t xhci_continue_transfer_locked(xhci_t* xhci, xhci_endpoint_t* 
         free_trbs--;
 
         state->offset += transfer_size;
-        state->remaining -= transfer_size;
     }
 
-    if (state->remaining > 0) {
+    if (state->offset < txn->length) {
         // still more data to queue, but we are out of TRBs.
         // come back and finish later.
         return ERR_SHOULD_WAIT;

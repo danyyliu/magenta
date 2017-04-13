@@ -82,6 +82,10 @@ static mx_status_t xhci_address_device(xhci_t* xhci, uint32_t slot_id, uint32_t 
     xhci_endpoint_t* ep = &slot->eps[0];
     status = xhci_endpoint_init(ep, TRANSFER_RING_SIZE);
     if (status < 0) return status;
+    ep->transfer_state = calloc(1, sizeof(xhci_transfer_state_t));
+    if (!ep->transfer_state) {
+        return ERR_NO_MEMORY;
+    }
     xhci_transfer_ring_t* transfer_ring = &ep->transfer_ring;
 
     xhci_input_control_context_t* icc = (xhci_input_control_context_t*)xhci->input_context;
@@ -200,6 +204,9 @@ static void xhci_disable_slot(xhci_t* xhci, uint32_t slot_id) {
 
     xprintf("cleaning up slot %d\n", slot_id);
     xhci_slot_t* slot = &xhci->slots[slot_id];
+    for (int i = 0; i < XHCI_NUM_EPS; i++) {
+        xhci_endpoint_free(&slot->eps[i]);
+    }
     io_buffer_release(&slot->buffer);
     memset(slot, 0, sizeof(*slot));
 }
@@ -308,7 +315,11 @@ static bool xhci_stop_endpoint(xhci_t* xhci, uint32_t slot_id, int ep_index) {
         // TRB_CC_CONTEXT_STATE_ERROR is normal here in the case of a disconnected device,
         // since by then the endpoint would already be in error state.
         printf("TRB_CMD_STOP_ENDPOINT failed cc: %d\n", cc);
+        return false;
     }
+
+    free(ep->transfer_state);
+    ep->transfer_state = NULL;
 
     list_node_t pending_copy;
     list_node_t queued_copy;
@@ -555,6 +566,10 @@ mx_status_t xhci_enable_endpoint(xhci_t* xhci, uint32_t slot_id, usb_endpoint_de
 
     // xhci_stop_endpoint() will handle the !enable case
     if (enable) {
+        ep->transfer_state = calloc(1, sizeof(xhci_transfer_state_t));
+        if (!ep->transfer_state) {
+            return ERR_NO_MEMORY;
+        }
         ep->enabled = true;
     }
 

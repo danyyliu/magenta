@@ -371,7 +371,10 @@ mx_status_t xhci_endpoint_init(xhci_endpoint_t* ep, int ring_count) {
     return NO_ERROR;
 }
 
-
+void xhci_endpoint_free(xhci_endpoint_t* ep) {
+    free(ep->transfer_state);
+    ep->transfer_state = NULL;
+}
 
 static void xhci_update_erdp(xhci_t* xhci, int interruptor) {
     xhci_event_ring_t* er = &xhci->event_rings[interruptor];
